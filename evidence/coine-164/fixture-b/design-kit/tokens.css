@@ -1,0 +1,12 @@
+/* Vendored export from the Design Kit. Refreshed wholesale; do not edit. */
+:root {
+  --color-bg: #f7f5f0;
+  --color-surface: #ffffff;
+  --color-text: #1d1b16;
+  --color-primary: #2f5d50;
+  --color-primary-text: #ffffff;
+  --radius-md: 8px;
+  --space-2: 8px;
+  --space-4: 16px;
+  --font-body: "Inter", system-ui, sans-serif;
+}

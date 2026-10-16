@@ -1,0 +1,10 @@
+- Design: apply SOLID, DRY, KISS — extract shared logic, no copy-paste, prefer the simplest solution.
+- Inputs and preconditions: validate early and fail fast with a clear exception.
+- Exceptions: catch specific types, never generic `Exception`.
+- Errors: log with context (user, request, stack trace); never expose internal errors to end users.
+- Logging: structured, with levels and context (timestamp, user_id, request_id, action); log business events, not only errors.
+- Comments: explain why, not what.
+- External input: validate and sanitize everything; SQL only with parameterized queries, never string concatenation.
+- `.env` files: listed in `.gitignore`.
+- Coverage: aim for >80% on critical paths.
+- Functions vs classes: prefer classes over free functions when the language supports them.

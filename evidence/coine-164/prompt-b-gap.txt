@@ -1,0 +1,1 @@
+Add a dismissible warning banner at the top of the bookings page announcing that bookings will be unavailable on Sunday 20 October from 08:00 to 12:00 for maintenance.

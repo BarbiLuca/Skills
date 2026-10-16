@@ -1,0 +1,1 @@
+Add a second card below the existing one, titled "Upcoming events", with the text "No events scheduled." and a primary button "Browse events".

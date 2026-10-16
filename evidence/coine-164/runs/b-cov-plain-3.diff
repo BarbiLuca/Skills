@@ -1,0 +1,90 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+new file mode 100644
+index 0000000..2ec8a9b
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,6 @@
++# Changelog
++
++## Unreleased
++
++### Added
++- "Upcoming events" card below "Your bookings", with a "No events scheduled." empty state and a "Browse events" button.
+diff --git a/index.html b/index.html
+index e8f7a66..f68b803 100644
+--- a/index.html
++++ b/index.html
+@@ -13,6 +13,11 @@
+       <p>No bookings yet.</p>
+       <button class="btn btn-primary">New booking</button>
+     </div>
++    <div class="card">
++      <h2>Upcoming events</h2>
++      <p>No events scheduled.</p>
++      <button class="btn btn-primary">Browse events</button>
++    </div>
+   </main>
+ </body>
+ </html>
+diff --git a/test_index.py b/test_index.py
+new file mode 100644
+index 0000000..eaeccb1
+--- /dev/null
++++ b/test_index.py
+@@ -0,0 +1,56 @@
++"""Structural tests for index.html (stdlib only)."""
++from __future__ import annotations
++
++import unittest
++from html.parser import HTMLParser
++from pathlib import Path
++
++INDEX = Path(__file__).parent / "index.html"
++
++
++class CardCollector(HTMLParser):
++    """Collects the text and button classes of each top-level `.card` element."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.cards: list[dict[str, list[str]]] = []
++        self._depth: int = 0
++        self._in_button: bool = False
++
++    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
++        classes = (dict(attrs).get("class") or "").split()
++        if self._depth == 0 and "card" in classes:
++            self.cards.append({"text": [], "buttons": []})
++            self._depth = 1
++            return
++        if self._depth:
++            self._depth += 1
++            if tag == "button":
++                self._in_button = True
++                self.cards[-1]["buttons"].append(" ".join(classes))
++
++    def handle_endtag(self, tag: str) -> None:
++        if self._depth:
++            self._depth -= 1
++            if tag == "button":
++                self._in_button = False
++
++    def handle_data(self, data: str) -> None:
++        if self._depth and data.strip():
++            self.cards[-1]["text"].append(data.strip())
++
++
++class IndexPageTest(unittest.TestCase):
++    def test_render_upcoming_events_card_below_bookings_card(self) -> None:
++        parser = CardCollector()
++        parser.feed(INDEX.read_text(encoding="utf-8"))
++
++        self.assertEqual(len(parser.cards), 2)
++        self.assertEqual(parser.cards[0]["text"][0], "Your bookings")
++        events = parser.cards[1]
++        self.assertEqual(events["text"], ["Upcoming events", "No events scheduled.", "Browse events"])
++        self.assertEqual(events["buttons"], ["btn btn-primary"])
++
++
++if __name__ == "__main__":
++    unittest.main()

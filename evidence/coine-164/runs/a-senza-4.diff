@@ -1,0 +1,387 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..638b99e
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,5 @@
++# Copy to .env and fill in the API key.
++RATES_API_URL=https://rates.example.com/v1
++RATES_API_KEY=
++# Optional, seconds.
++RATES_API_TIMEOUT=10
+diff --git a/.gitignore b/.gitignore
+index 1ce43cf..021adef 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,3 @@
+ __pycache__/
+ *.db
++.env
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+new file mode 100644
+index 0000000..31f849e
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,6 @@
++# Changelog
++
++## Unreleased
++
++### Added
++- `fetch BASE QUOTE` command: downloads the current exchange rate from the rates API and stores it in the local database. Requires `RATES_API_URL` and `RATES_API_KEY` in `.env` (see `.env.example`).
+diff --git a/README.md b/README.md
+index 9ce331b..883a30c 100644
+--- a/README.md
++++ b/README.md
+@@ -2,5 +2,7 @@
+ 
+ Track currency exchange rates in a local SQLite file.
+ 
++- Setup: `cp .env.example .env` and set `RATES_API_KEY`
++- Fetch: `python3 -m app fetch EUR USD`
+ - Run: `python3 -m app list EUR`
+ - Test: `python3 -m unittest`
+diff --git a/app/__main__.py b/app/__main__.py
+index 42ccd30..1e2e984 100644
+--- a/app/__main__.py
++++ b/app/__main__.py
+@@ -1,6 +1,10 @@
+ import argparse
++import sys
+ 
++from app.config import ConfigError, load_config
+ from app.db import Database
++from app.rates_client import RatesClient, RatesClientError
++from app.rates_service import RatesService, RatesServiceError
+ 
+ 
+ def main() -> None:
+@@ -8,6 +12,9 @@ def main() -> None:
+     subcommands = parser.add_subparsers(dest="command", required=True)
+     list_parser = subcommands.add_parser("list", help="List stored rates for a base currency")
+     list_parser.add_argument("base")
++    fetch_parser = subcommands.add_parser("fetch", help="Download and store the current rate")
++    fetch_parser.add_argument("base")
++    fetch_parser.add_argument("quote")
+     args = parser.parse_args()
+ 
+     database = Database()
+@@ -15,6 +22,14 @@ def main() -> None:
+     if args.command == "list":
+         for row in database.list_rates(args.base):
+             print(f"{row['base']}/{row['quote']} {row['rate']} ({row['fetched_at']})")
++    elif args.command == "fetch":
++        try:
++            config = load_config()
++            client = RatesClient(config.rates_api_url, config.rates_api_key, config.rates_api_timeout)
++            rate = RatesService(client, database).fetch_rate(args.base, args.quote)
++        except (ConfigError, RatesClientError, RatesServiceError) as error:
++            sys.exit(f"error: {error}")
++        print(f"{args.base.upper()}/{args.quote.upper()} {rate}")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/app/config.py b/app/config.py
+new file mode 100644
+index 0000000..b4cd444
+--- /dev/null
++++ b/app/config.py
+@@ -0,0 +1,61 @@
++import os
++from dataclasses import dataclass
++from pathlib import Path
++
++DEFAULT_ENV_PATH = Path(".env")
++DEFAULT_RATES_API_TIMEOUT = 10.0
++
++
++class ConfigError(Exception):
++    """Raised when a required configuration value is missing or invalid."""
++
++
++@dataclass(frozen=True)
++class Config:
++    """Application settings read from the environment and the `.env` file."""
++
++    rates_api_url: str
++    rates_api_key: str
++    rates_api_timeout: float
++
++
++def _read_env_file(path: Path) -> dict[str, str]:
++    """Parse simple KEY=VALUE lines, ignoring blanks and comments."""
++    values: dict[str, str] = {}
++    if not path.is_file():
++        return values
++    for line in path.read_text(encoding="utf-8").splitlines():
++        line = line.strip()
++        if not line or line.startswith("#") or "=" not in line:
++            continue
++        key, value = line.split("=", 1)
++        values[key.strip()] = value.strip().strip("\"'")
++    return values
++
++
++def load_config(env_path: Path = DEFAULT_ENV_PATH) -> Config:
++    """Build the configuration; real environment variables override `.env`.
++
++    @param env_path Path of the `.env` file to read.
++    @return The application configuration.
++    @throws ConfigError If a required value is missing or malformed.
++    """
++    values = {**_read_env_file(env_path), **os.environ}
++
++    def required(name: str) -> str:
++        value = values.get(name, "").strip()
++        if not value:
++            raise ConfigError(f"Missing required setting {name} (set it in .env or the environment)")
++        return value
++
++    timeout_text = values.get("RATES_API_TIMEOUT", "").strip()
++    try:
++        timeout = float(timeout_text) if timeout_text else DEFAULT_RATES_API_TIMEOUT
++    except ValueError as error:
++        raise ConfigError(f"RATES_API_TIMEOUT must be a number, got {timeout_text!r}") from error
++
++    return Config(
++        rates_api_url=required("RATES_API_URL"),
++        rates_api_key=required("RATES_API_KEY"),
++        rates_api_timeout=timeout,
++    )
+diff --git a/app/db.py b/app/db.py
+index fce9048..4ce5dc8 100644
+--- a/app/db.py
++++ b/app/db.py
+@@ -28,6 +28,22 @@ class Database:
+                 "fetched_at TEXT NOT NULL)"
+             )
+ 
++    def insert_rate(self, base: str, quote: str, rate: float, fetched_at: str) -> None:
++        """Store one exchange rate.
++
++        @param base Base currency code, e.g. "EUR".
++        @param quote Quote currency code, e.g. "USD".
++        @param rate Units of quote per one unit of base.
++        @param fetched_at ISO 8601 timestamp of when the rate was fetched.
++        @return None
++        @throws sqlite3.Error If the write fails.
++        """
++        with self.connect() as connection:
++            connection.execute(
++                "INSERT INTO rates (base, quote, rate, fetched_at) VALUES (?, ?, ?, ?)",
++                (base, quote, rate, fetched_at),
++            )
++
+     def list_rates(self, base: str) -> list:
+         """Return every stored rate for a base currency, newest first."""
+         with self.connect() as connection:
+diff --git a/app/rates_client.py b/app/rates_client.py
+new file mode 100644
+index 0000000..6ce454f
+--- /dev/null
++++ b/app/rates_client.py
+@@ -0,0 +1,46 @@
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++from typing import Any
++
++
++class RatesClientError(Exception):
++    """Raised when the rates API cannot be reached or returns an invalid response."""
++
++
++class RatesClient:
++    """HTTP client for the exchange rates API. Transport only, no business logic."""
++
++    def __init__(self, base_url: str, api_key: str, timeout: float) -> None:
++        self._base_url = base_url.rstrip("/")
++        self._api_key = api_key
++        self._timeout = timeout
++
++    def get_latest(self, base: str, symbols: list[str]) -> dict[str, Any]:
++        """Call GET /latest and return the decoded JSON body.
++
++        @param base Base currency code, e.g. "EUR".
++        @param symbols Quote currency codes, e.g. ["USD"].
++        @return The decoded response, e.g. {"base": "EUR", "rates": {"USD": 1.08}}.
++        @throws RatesClientError On network errors, non-2xx status, or a non-JSON body.
++        """
++        query = urllib.parse.urlencode({"base": base, "symbols": ",".join(symbols)}, safe=",")
++        request = urllib.request.Request(
++            f"{self._base_url}/latest?{query}",
++            headers={"X-Api-Key": self._api_key, "Accept": "application/json"},
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=self._timeout) as response:
++                body = response.read()
++        except urllib.error.HTTPError as error:
++            raise RatesClientError(f"Rates API returned HTTP {error.code}") from error
++        except (urllib.error.URLError, TimeoutError) as error:
++            raise RatesClientError(f"Rates API unreachable: {error}") from error
++        try:
++            payload = json.loads(body)
++        except json.JSONDecodeError as error:
++            raise RatesClientError("Rates API returned invalid JSON") from error
++        if not isinstance(payload, dict):
++            raise RatesClientError("Rates API returned an unexpected JSON shape")
++        return payload
+diff --git a/app/rates_service.py b/app/rates_service.py
+new file mode 100644
+index 0000000..0172604
+--- /dev/null
++++ b/app/rates_service.py
+@@ -0,0 +1,46 @@
++from datetime import datetime, timezone
++from typing import Callable
++
++from app.db import Database
++from app.rates_client import RatesClient
++
++
++class RatesServiceError(Exception):
++    """Raised when a rate cannot be obtained from the API response."""
++
++
++def _utc_now() -> datetime:
++    return datetime.now(timezone.utc)
++
++
++class RatesService:
++    """Fetches exchange rates from the API and stores them locally."""
++
++    def __init__(
++        self,
++        client: RatesClient,
++        database: Database,
++        clock: Callable[[], datetime] = _utc_now,
++    ) -> None:
++        self._client = client
++        self._database = database
++        self._clock = clock
++
++    def fetch_rate(self, base: str, quote: str) -> float:
++        """Download the current base/quote rate and store it in the rates table.
++
++        @param base Base currency code, case-insensitive.
++        @param quote Quote currency code, case-insensitive.
++        @return The stored rate.
++        @throws RatesClientError If the API call fails.
++        @throws RatesServiceError If the response does not contain a valid rate.
++        """
++        base = base.upper()
++        quote = quote.upper()
++        payload = self._client.get_latest(base, [quote])
++        rates = payload.get("rates")
++        rate = rates.get(quote) if isinstance(rates, dict) else None
++        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
++            raise RatesServiceError(f"Rates API response has no numeric rate for {base}/{quote}")
++        self._database.insert_rate(base, quote, float(rate), self._clock().isoformat())
++        return float(rate)
+diff --git a/tests/test_fetch.py b/tests/test_fetch.py
+new file mode 100644
+index 0000000..086cb4a
+--- /dev/null
++++ b/tests/test_fetch.py
+@@ -0,0 +1,100 @@
++import io
++import json
++import tempfile
++import unittest
++import urllib.error
++from datetime import datetime, timezone
++from pathlib import Path
++from unittest import mock
++
++from app.config import Config, ConfigError, load_config
++from app.db import Database
++from app.rates_client import RatesClient, RatesClientError
++from app.rates_service import RatesService, RatesServiceError
++
++
++def _fake_response(payload: dict) -> mock.MagicMock:
++    response = mock.MagicMock()
++    response.read.return_value = json.dumps(payload).encode("utf-8")
++    response.__enter__.return_value = response
++    return response
++
++
++class RatesClientTest(unittest.TestCase):
++    def test_get_latest_sends_api_key_and_query(self) -> None:
++        client = RatesClient("https://rates.example.com/v1", "secret", 5.0)
++        with mock.patch("urllib.request.urlopen") as urlopen:
++            urlopen.return_value = _fake_response({"base": "EUR", "rates": {"USD": 1.08}})
++            payload = client.get_latest("EUR", ["USD"])
++
++        request = urlopen.call_args.args[0]
++        self.assertEqual(request.full_url, "https://rates.example.com/v1/latest?base=EUR&symbols=USD")
++        self.assertEqual(request.get_header("X-api-key"), "secret")
++        self.assertEqual(urlopen.call_args.kwargs["timeout"], 5.0)
++        self.assertEqual(payload, {"base": "EUR", "rates": {"USD": 1.08}})
++
++    def test_get_latest_raises_client_error_on_http_error(self) -> None:
++        client = RatesClient("https://rates.example.com/v1", "wrong", 5.0)
++        error = urllib.error.HTTPError("url", 401, "Unauthorized", {}, io.BytesIO(b""))
++        with mock.patch("urllib.request.urlopen", side_effect=error):
++            with self.assertRaises(RatesClientError):
++                client.get_latest("EUR", ["USD"])
++
++
++class RatesServiceTest(unittest.TestCase):
++    def setUp(self) -> None:
++        self._directory = tempfile.TemporaryDirectory()
++        self.database = Database(Path(self._directory.name) / "test.db")
++        self.database.init_schema()
++        self.client = mock.create_autospec(RatesClient, instance=True)
++        self.now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
++        self.service = RatesService(self.client, self.database, clock=lambda: self.now)
++
++    def tearDown(self) -> None:
++        self._directory.cleanup()
++
++    def test_fetch_rate_stores_rate_in_database(self) -> None:
++        self.client.get_latest.return_value = {"base": "EUR", "rates": {"USD": 1.08}}
++
++        rate = self.service.fetch_rate("eur", "usd")
++
++        self.assertEqual(rate, 1.08)
++        self.client.get_latest.assert_called_once_with("EUR", ["USD"])
++        self.assertEqual(
++            self.database.list_rates("EUR"),
++            [{"base": "EUR", "quote": "USD", "rate": 1.08, "fetched_at": "2026-10-16T12:00:00+00:00"}],
++        )
++
++    def test_fetch_rate_raises_when_quote_missing(self) -> None:
++        self.client.get_latest.return_value = {"base": "EUR", "rates": {}}
++
++        with self.assertRaises(RatesServiceError):
++            self.service.fetch_rate("EUR", "USD")
++        self.assertEqual(self.database.list_rates("EUR"), [])
++
++
++class ConfigTest(unittest.TestCase):
++    def test_load_config_reads_env_file(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            env_file = Path(directory) / ".env"
++            env_file.write_text(
++                "# comment\nRATES_API_URL=https://rates.example.com/v1\nRATES_API_KEY=\"secret\"\n",
++                encoding="utf-8",
++            )
++            with mock.patch.dict("os.environ", {}, clear=True):
++                config = load_config(env_file)
++
++        self.assertEqual(
++            config,
++            Config(rates_api_url="https://rates.example.com/v1", rates_api_key="secret", rates_api_timeout=10.0),
++        )
++
++    def test_load_config_raises_when_key_missing(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            with mock.patch.dict("os.environ", {}, clear=True):
++                with self.assertRaises(ConfigError):
++                    load_config(Path(directory) / ".env")
++
++
++if __name__ == "__main__":
++    unittest.main()
